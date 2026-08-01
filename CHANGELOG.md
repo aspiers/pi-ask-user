@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Responsive context collapse for overlay and inline prompts; oversized context preserves the full value while keeping the question and choices visible, and `ctrl+e` toggles the expanded view.
+- Configurable `auto` or always-single-column layouts for wide single-select prompts. Closes #30.
+- `herdr:blocked` lifecycle events while waiting for structured or freeform user input.
+
 ## [0.13.1](https://github.com/edlsh/pi-ask-user/releases/tag/v0.13.1) - 2026-08-01
 
 ### Fixed

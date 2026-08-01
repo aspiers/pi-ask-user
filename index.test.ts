@@ -248,10 +248,100 @@ function createTheme() {
    };
 }
 
+function renderSingleSelectFromFactory(factory: unknown, width = 120): string {
+   // The custom UI callback is untyped in the test harness; narrow only the surface exercised here.
+   const createComponent = factory as unknown as (
+      tui: unknown,
+      theme: unknown,
+      keybindings: unknown,
+      done: () => void,
+   ) => { singleSelectList: { render: (renderWidth: number) => string[] } };
+   const component = createComponent(
+      { requestRender() { }, terminal: { rows: 24 } },
+      createTheme(),
+      createKeybindings(),
+      () => { },
+   );
+   return component.singleSelectList.render(width).join("\n");
+}
+
 describe("ask_user", () => {
    test("registers with executionMode 'sequential' so the agent loop awaits the user's answer before other tool calls run", async () => {
       const tool = await setupTool();
       expect((tool as any).executionMode).toBe("sequential");
+   });
+
+   test("emits Herdr blocked lifecycle while awaiting a structured answer", async () => {
+      const tool = await setupTool();
+
+      await tool.execute(
+         "tool-call-id",
+         { question: "Continue?", options: ["Yes"] },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: { custom: async () => ({ kind: "selection", selections: ["Yes"] }) },
+         },
+      );
+
+      expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
+         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
+         { name: "herdr:blocked", payload: { active: false } },
+      ]);
+   });
+
+   test("emits Herdr blocked lifecycle while awaiting a freeform answer", async () => {
+      const tool = await setupTool();
+
+      await tool.execute(
+         "tool-call-id",
+         { question: "Why?", options: [] },
+         undefined,
+         undefined,
+         { hasUI: true, ui: { input: async () => "Because" } },
+      );
+
+      expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
+         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
+         { name: "herdr:blocked", payload: { active: false } },
+      ]);
+   });
+
+   test("clears Herdr blocked lifecycle when structured UI rejects", async () => {
+      const tool = await setupTool();
+
+      const result = await tool.execute(
+         "tool-call-id",
+         { question: "Continue?", options: ["Yes"] },
+         undefined,
+         undefined,
+         { hasUI: true, ui: { custom: async () => { throw new Error("UI failed"); } } },
+      );
+
+      expect(result.isError).toBe(true);
+      expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
+         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
+         { name: "herdr:blocked", payload: { active: false } },
+      ]);
+   });
+
+   test("clears Herdr blocked lifecycle when freeform input is cancelled", async () => {
+      const tool = await setupTool();
+
+      const result = await tool.execute(
+         "tool-call-id",
+         { question: "Why?", options: [] },
+         undefined,
+         undefined,
+         { hasUI: true, ui: { input: async () => undefined } },
+      );
+
+      expect(result.details.cancelled).toBe(true);
+      expect(emittedEvents.filter((event) => event.name === "herdr:blocked")).toEqual([
+         { name: "herdr:blocked", payload: { active: true, label: "Waiting for user response" } },
+         { name: "herdr:blocked", payload: { active: false } },
+      ]);
    });
 
    test("uses overlay mode by default", async () => {
@@ -1491,6 +1581,70 @@ describe("ask_user", () => {
       expect(rendered).toContain("The alpha option keeps the rollout conservative.");
    });
 
+   test("keeps wide single-select prompts in one column when requested", async () => {
+      const tool = await setupTool();
+      let rendered = "";
+
+      const result = await tool.execute(
+         "tool-call-id",
+         {
+            question: "Which option should we use?",
+            options: [
+               { title: "Alpha", description: "The alpha option stays below its title." },
+               { title: "Beta", description: "The beta option stays below its title." },
+            ],
+            singleSelectLayout: "list",
+         },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: {
+               custom: async (factory: unknown) => {
+                  rendered = renderSingleSelectFromFactory(factory);
+                  return null;
+               },
+            },
+         },
+      );
+
+      expect(result.isError).not.toBe(true);
+      expect(rendered).toContain("The alpha option stays below its title.");
+      expect(rendered).not.toContain("## Alpha");
+      expect(rendered).not.toContain(" │ ");
+   });
+
+   test("uses PI_ASK_USER_SINGLE_SELECT_LAYOUT unless the call overrides it", async () => {
+      stubEnv("PI_ASK_USER_SINGLE_SELECT_LAYOUT", "list");
+      const tool = await setupTool();
+      const render = async (singleSelectLayout?: "auto") => {
+         let output = "";
+         await tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: [{ title: "Alpha", description: "Alpha details." }],
+               singleSelectLayout,
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: unknown) => {
+                     output = renderSingleSelectFromFactory(factory);
+                     return null;
+                  },
+               },
+            },
+         );
+         return output;
+      };
+
+      expect(await render()).not.toContain("## Alpha");
+      expect(await render("auto")).toContain("## Alpha");
+   });
+
    test("shows a custom response preview in the wide details pane", async () => {
       const tool = await setupTool();
       let rendered = "";
@@ -1566,15 +1720,58 @@ describe("ask_user", () => {
       expect(rendered).toContain("The alpha option keeps the rollout conservative.");
    });
 
-   test("keeps the top prompt, answers, and help visible when a long overlay prompt overflows", async () => {
+   test.each([
+      { width: 40, rows: 12 },
+      { width: 60, rows: 20 },
+   ])("keeps the question, collapsed context, and a choice visible at $width x $rows", async ({ width, rows }) => {
       const tool = await setupTool();
       let rendered: string[] = [];
-      let capturedOptions: any;
+
+      await tool.execute(
+         "tool-call-id",
+         {
+            question: "Which deployment strategy should we use?",
+            context: "Decision-critical context detail. ".repeat(80),
+            options: ["Alpha", "Beta"],
+         },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: {
+               custom: async (factory: any) => {
+                  const component = factory(
+                     { requestRender() { }, terminal: { rows } },
+                     createTheme(),
+                     createKeybindings(),
+                     () => { },
+                  );
+                  rendered = component.render(width);
+                  return null;
+               },
+            },
+         },
+      );
+
+      const joined = rendered.join("\n").replace(/\s+/g, " ");
+      expect(joined).toContain("Which deployment strategy should we");
+      expect(joined).toContain("use?");
+      expect(joined).toContain("→ 1. Alpha");
+      expect(joined).toContain("Context (");
+      expect(joined).toContain("ctrl+e");
+      expect(joined).not.toContain("Decision-critical context detail.");
+   });
+
+   test("expands and re-collapses long context without losing filtered selection", async () => {
+      const tool = await setupTool();
+      let collapsed = "";
+      let expanded = "";
+      let recollapsed = "";
 
       const result = await tool.execute(
          "tool-call-id",
          {
-            question: "This is a very long question. ".repeat(80),
+            question: "Which option should we use?",
             context: "Context detail. ".repeat(80),
             options: ["Alpha", "Beta"],
          },
@@ -1583,30 +1780,35 @@ describe("ask_user", () => {
          {
             hasUI: true,
             ui: {
-               custom: async (factory: any, options: any) => {
-                  capturedOptions = options;
+               custom: async (factory: any) => {
+                  let resolved: unknown;
                   const component = factory(
                      { requestRender() { }, terminal: { rows: 12 } },
                      createTheme(),
                      createKeybindings(),
-                     () => { },
+                     (value: unknown) => { resolved = value; },
                   );
-                  rendered = component.render(50);
-                  return null;
+                  component.handleInput("b");
+                  collapsed = component.render(50).join("\n");
+                  component.handleInput("ctrl+e");
+                  component.render(50);
+                  component.handleInput("end");
+                  expanded = component.render(50).join("\n");
+                  component.handleInput("ctrl+e");
+                  recollapsed = component.render(50).join("\n");
+                  component.handleInput("enter");
+                  return resolved ?? null;
                },
             },
          },
       );
 
-      const joined = rendered.join("\n");
-      expect(result.isError).not.toBe(true);
-      expect(capturedOptions.overlay).toBe(true);
-      expect(rendered.length).toBeLessThanOrEqual(10);
-      expect(joined).toContain("Question");
-      expect(joined).toContain("This is a very long question.");
-      expect(joined).toContain("Alpha");
-      expect(joined).toContain("PgUp/PgDn prompt");
-      expect(joined).toContain("↓");
+      expect(collapsed).toContain("Context (");
+      expect(expanded).toContain("Context detail.");
+      expect(expanded).toContain("Beta");
+      expect(recollapsed).not.toContain("Context detail.");
+      expect(result.details.response).toEqual({ kind: "selection", selections: ["Beta"] });
+      expect(result.details.context).toContain("Context detail.");
    });
 
    test("scrolls constrained multi-select overlays to the comment and freeform rows", async () => {
@@ -1687,6 +1889,8 @@ describe("ask_user", () => {
                      () => { },
                   );
                   initialRendered = component.render(50);
+                  component.handleInput("ctrl+e");
+                  component.render(50);
                   component.handleInput("end");
                   scrolledRendered = component.render(50);
                   component.handleInput("home");
@@ -1701,7 +1905,8 @@ describe("ask_user", () => {
       expect(initialRendered.join("\n")).toContain("Question line 0");
       expect(scrolledRendered.join("\n")).toContain("Context line 7");
       expect(scrolledRendered.join("\n")).toContain("Alpha");
-      expect(scrolledRendered.join("\n")).toContain("PgUp/PgDn prompt");
+      expect(scrolledRendered.join("\n")).toContain("ctrl+e collapse context");
+      expect(scrolledRendered.join("\n")).toContain("PgUp/P");
       expect(restoredRendered.join("\n")).toContain("Question line 0");
    });
 
@@ -1831,6 +2036,217 @@ describe("ask_user", () => {
 
       expect(result.isError).not.toBe(true);
       expect(rendered.length).toBeGreaterThan(10);
+   });
+
+   test("collapses oversized context in inline mode but leaves short context expanded", async () => {
+      const tool = await setupTool();
+      const render = async (context: string) => {
+         let output = "";
+         await tool.execute(
+            "tool-call-id",
+            { question: "Pick one", context, options: ["Alpha", "Beta"], displayMode: "inline" },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) => {
+                     const component = factory(
+                        { requestRender() { }, terminal: { rows: 12 } },
+                        createTheme(),
+                        createKeybindings(),
+                        () => { },
+                     );
+                     output = component.render(40).join("\n");
+                     return null;
+                  },
+               },
+            },
+         );
+         return output;
+      };
+
+      const shortOutput = await render("Short context.");
+      const longOutput = await render("Long context detail. ".repeat(80));
+      expect(shortOutput).toContain("Short context.");
+      expect(shortOutput).not.toContain("Context (");
+      expect(longOutput).toContain("Context (");
+      expect(longOutput).not.toContain("Long context detail.");
+   });
+
+   test("keeps medium inline context expanded until the user collapses it", async () => {
+      const tool = await setupTool();
+      let firstExpanded = "";
+      let secondExpanded = "";
+      let collapsedAgain = "";
+
+      await tool.execute(
+         "tool-call-id",
+         {
+            question: "Pick one",
+            context: Array.from({ length: 6 }, (_, index) => `Medium context line ${index}`).join("\n"),
+            options: ["Alpha", "Beta"],
+            displayMode: "inline",
+         },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: {
+               custom: async (factory: any) => {
+                  const component = factory(
+                     { requestRender() { }, terminal: { rows: 24 } },
+                     createTheme(),
+                     createKeybindings(),
+                     () => { },
+                  );
+                  component.render(60);
+                  component.handleInput("ctrl+e");
+                  firstExpanded = component.render(60).join("\n");
+                  secondExpanded = component.render(60).join("\n");
+                  component.handleInput("ctrl+e");
+                  collapsedAgain = component.render(60).join("\n");
+                  return null;
+               },
+            },
+         },
+      );
+
+      expect(firstExpanded).toContain("Medium context line 5");
+      expect(secondExpanded).toContain("Medium context line 5");
+      expect(collapsedAgain).toContain("Context (");
+      expect(collapsedAgain).not.toContain("Medium context line 5");
+   });
+
+   test("bounds and scrolls expanded context in inline mode", async () => {
+      const tool = await setupTool();
+      let expanded: string[] = [];
+      let scrolled: string[] = [];
+
+      await tool.execute(
+         "tool-call-id",
+         {
+            question: "Pick one",
+            context: Array.from({ length: 20 }, (_, index) => `Inline context line ${index}`).join("\n"),
+            options: ["Alpha", "Beta"],
+            displayMode: "inline",
+         },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: {
+               custom: async (factory: any) => {
+                  const component = factory(
+                     { requestRender() { }, terminal: { rows: 12 } },
+                     createTheme(),
+                     createKeybindings(),
+                     () => { },
+                  );
+                  component.render(50);
+                  component.handleInput("ctrl+e");
+                  expanded = component.render(50);
+                  component.handleInput("end");
+                  scrolled = component.render(50);
+                  return null;
+               },
+            },
+         },
+      );
+
+      expect(expanded.length).toBeLessThanOrEqual(10);
+      expect(expanded.join("\n")).toContain("Alpha");
+      expect(scrolled.join("\n")).toContain("Inline context line 19");
+      expect(scrolled.join("\n")).toContain("Alpha");
+      expect(scrolled.join("\n")).toContain("PgUp/P");
+   });
+
+   test("moves the context toggle when a configured shortcut owns ctrl+e", async () => {
+      const tool = await setupTool();
+      let help = "";
+      let commentEnabled = false;
+      let expanded = "";
+
+      await tool.execute(
+         "tool-call-id",
+         {
+            question: "Pick one",
+            context: "Long context detail. ".repeat(80),
+            options: ["Alpha", "Beta"],
+            allowComment: true,
+            commentToggleKey: "ctrl+e",
+         },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: {
+               custom: async (factory: any) => {
+                  const component = factory(
+                     { requestRender() { }, terminal: { rows: 12 } },
+                     createTheme(),
+                     createKeybindings(),
+                     () => { },
+                  );
+                  component.render(50);
+                  help = (component as any).helpText.render(120).join("\n");
+                  component.handleInput("ctrl+e");
+                  commentEnabled = (component as any).singleSelectList.isCommentEnabled();
+                  component.handleInput("ctrl+x");
+                  component.render(50);
+                  component.handleInput("end");
+                  expanded = component.render(50).join("\n");
+                  return null;
+               },
+            },
+         },
+      );
+
+      expect(help).toContain("ctrl+e toggle context");
+      expect(help).toContain("ctrl+x expand context");
+      expect(commentEnabled).toBe(true);
+      expect(expanded).toContain("Long context detail.");
+   });
+
+   test("moves the context toggle when the overlay shortcut owns ctrl+e", async () => {
+      const tool = await setupTool();
+      let help = "";
+      let expanded = "";
+
+      await tool.execute(
+         "tool-call-id",
+         {
+            question: "Pick one",
+            context: "Long context detail. ".repeat(80),
+            options: ["Alpha", "Beta"],
+            overlayToggleKey: "ctrl+e",
+         },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: {
+               custom: async (factory: any) => {
+                  const component = factory(
+                     { requestRender() { }, terminal: { rows: 12 } },
+                     createTheme(),
+                     createKeybindings(),
+                     () => { },
+                  );
+                  component.render(50);
+                  help = (component as any).helpText.render(120).join("\n");
+                  component.handleInput("ctrl+x");
+                  component.render(50);
+                  component.handleInput("end");
+                  expanded = component.render(50).join("\n");
+                  return null;
+               },
+            },
+         },
+      );
+
+      expect(help).toContain("ctrl+x expand context");
+      expect(expanded).toContain("Long context detail.");
    });
 
    test("submits immediately when the comment toggle is off", async () => {

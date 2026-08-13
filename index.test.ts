@@ -168,7 +168,10 @@ beforeAll(() => {
             return super.render().map((line) => this.mdTheme.bold(line));
          }
       },
-      matchesKey: (data: string, key: string) => data === key,
+      matchesKey: (data: string, key: string) => data === key
+         || (key === "alt+o" && /^\x1b\[111;3:[123]u$/.test(data)),
+      isKeyRepeat: (data: string) => data.includes(":2u"),
+      isKeyRelease: (data: string) => data.includes(":3u"),
       Spacer: class {
          render() {
             return [""];
@@ -669,10 +672,16 @@ describe("ask_user", () => {
                ui: {
                   custom: async (_factory: any, options: any) => {
                      options.onHandle?.(handle);
-                     // Simulate the user pressing alt+o twice while the overlay is shown.
-                     const firstResult = inputHandler?.("alt+o");
-                     const secondResult = inputHandler?.("alt+o");
+                     // Kitty progressive keyboard reporting emits repeat and
+                     // release events in addition to the initial press. They
+                     // must be consumed without toggling the overlay again.
+                     const firstResult = inputHandler?.("\x1b[111;3:1u");
+                     const repeatResult = inputHandler?.("\x1b[111;3:2u");
+                     const releaseResult = inputHandler?.("\x1b[111;3:3u");
+                     const secondResult = inputHandler?.("\x1b[111;3:1u");
                      expect(firstResult).toEqual({ consume: true });
+                     expect(repeatResult).toEqual({ consume: true });
+                     expect(releaseResult).toEqual({ consume: true });
                      expect(secondResult).toEqual({ consume: true });
                      return null;
                   },
@@ -1840,6 +1849,44 @@ describe("ask_user", () => {
       expect(rendered).not.toContain("Details");
       expect(rendered).not.toContain(" │ ");
       expect(rendered).toContain("The alpha option keeps the rollout conservative.");
+   });
+
+   test("expands the option viewport into unused prompt space on tall terminals", async () => {
+      const tool = await setupTool();
+      let rendered: string[] = [];
+
+      const result = await tool.execute(
+         "tool-call-id",
+         {
+            question: "Which option should we use?",
+            options: Array.from({ length: 15 }, (_, index) => `Option ${index + 1}`),
+            allowFreeform: false,
+         },
+         undefined,
+         undefined,
+         {
+            hasUI: true,
+            ui: {
+               custom: async (factory: any) => {
+                  const component = factory(
+                     { requestRender() { }, terminal: { rows: 40 } },
+                     createTheme(),
+                     createKeybindings(),
+                     () => { },
+                  );
+                  rendered = component.render(80);
+                  return null;
+               },
+            },
+         },
+      );
+
+      const joined = rendered.join("\n");
+      expect(result.isError).not.toBe(true);
+      expect(rendered.length).toBeLessThanOrEqual(34);
+      expect(rendered.length).toBeGreaterThan(16);
+      expect(joined).toContain("Option 15");
+      expect(joined).not.toContain("(1/15)");
    });
 
    test.each([
